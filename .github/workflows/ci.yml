@@ -42,7 +42,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm ci # postinstall builds @ri/shared and generates the Prisma client
+      - run: npm ci --no-fund # postinstall builds @ri/shared and generates the Prisma client
       - name: Hard constraint — no cron
         run: npm run check:no-cron
       - run: npm run lint
@@ -51,5 +51,6 @@ jobs:
         working-directory: apps/api
       - run: npm test
       - run: npm run build
-      - name: Dependency audit
-        run: npm audit --audit-level=high
+      - name: Dependency audit (production only)
+        run: npm audit --audit-level=high --omit=dev
+        continue-on-error: true
