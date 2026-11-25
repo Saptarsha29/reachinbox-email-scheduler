@@ -1,0 +1,363 @@
+// Data model — see GODFATHER §4 for the email state machine.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id               String            @id @default(cuid())
+  /// Null for accounts created with email + password (set when the owner later signs in with Google).
+  googleId         String?           @unique
+  /// scrypt hash (see modules/auth/password.ts). Null for Google-only accounts.
+  passwordHash     String?
+  email            String            @unique
+  name             String
+  avatarUrl        String?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  campaigns        Campaign[]
+  slack            SlackConnection?
+  suppressed       SuppressedEmail[]
+  assistantActions AssistantAction[]
+  attachments      Attachment[]
+  drafts           Draft[]
+  leadLists        LeadList[]
+  webhooks         Webhook[]
+  /// First-run onboarding answers, tour progress and checklist state (see shared/onboarding.ts). Null = not seen yet.
+  onboarding       Json?
+}
+
+/// One Slack workspace/channel per user (tenant = user).
+model SlackConnection {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  teamId        String
+  teamName      String
+  channelId     String
+  channelName   String
+  webhookUrlEnc String
+  botTokenEnc   String?
+  isValid       Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+/// Ethereal SMTP accounts used to send.
+model Sender {
+  id          String  @id @default(cuid())
+  email       String  @unique
+  displayName String
+  smtpHost    String  @default("smtp.ethereal.email")
+  smtpPort    Int     @default(587)
+  smtpUser    String
+  smtpPassEnc String
+  hourlyLimit Int?
+  isActive    Boolean @default(true)
+  emails      Email[]
+
+  /// Warm-up ramp: a daily cap that starts at warmupStart and grows by warmupIncrement per day
+  /// until warmupTarget, after which the cap lifts.
+  warmupEnabled       Boolean   @default(false)
+  warmupStartedAt     DateTime?
+  warmupStart         Int       @default(5)
+  warmupIncrement     Int       @default(5)
+  warmupTarget        Int       @default(50)
+
+  /// Circuit breaker: too many failures in a row (or a login error) pause the sender until pausedUntil.
+  consecutiveFailures Int       @default(0)
+  lastError           String?
+  pausedUntil         DateTime?
+  pauseReason         String?
+
+  /// Account settings (connect flow, per-account limits, signature, tags).
+  /// GOOGLE | OUTLOOK | CUSTOM | ETHEREAL
+  provider            String    @default("ETHEREAL")
+  firstName           String    @default("")
+  lastName            String    @default("")
+  /// Campaign emails per day from this account; null = no daily limit.
+  dailyLimit          Int?
+  /// Per-account minimum gap between sends (can only raise the server-wide floor).
+  minDelayMs          Int?
+  signature           String?
+  replyTo             String?
+  tags                String[]  @default([])
+  /// Last DNS check (SPF / DKIM / DMARC / MX) and last connectivity test.
+  dnsResult           Json?
+  dnsCheckedAt        DateTime?
+  lastTestAt          DateTime?
+  lastTestOk          Boolean?
+  /// The owner has seen lastError and chosen to ignore it (clears the "needs attention" flag).
+  errorAcknowledgedAt DateTime?
+  createdAt           DateTime  @default(now())
+}
+
+/// Per-user do-not-contact list. Leads on it are skipped when a campaign is created.
+model SuppressedEmail {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  email     String
+  createdAt DateTime @default(now())
+
+  @@unique([userId, email])
+  @@index([userId, createdAt])
+}
+
+/// Audit trail of every change the assistant made (or was asked to make and the user declined).
+model AssistantAction {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tool      String
+  args      Json
+  /// EXECUTED | CANCELLED | FAILED | EXPIRED
+  status    String
+  summary   String
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+/// A compose form saved for later. It is only data: a draft has no emails and no jobs, so nothing can be sent from
+/// one, and the scheduler never sees it. Scheduling from the form deletes it.
+model Draft {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  payload   Json
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  @@index([userId, updatedAt])
+}
+
+/// A saved, reusable list of recipients, optionally checked for deliverability (see shared/leads.ts for what a check means).
+model LeadList {
+  id        String     @id @default(cuid())
+  userId    String
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  leads     ListLead[]
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  @@index([userId, updatedAt])
+}
+
+model ListLead {
+  id         String    @id @default(cuid())
+  listId     String
+  list       LeadList  @relation(fields: [listId], references: [id], onDelete: Cascade)
+  email      String
+  name       String?
+  vars       Json?
+  /// VALID | RISKY | UNDELIVERABLE | UNKNOWN; null = not checked yet.
+  status     String?
+  reason     String?
+  suggestion String?
+  checkedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@unique([listId, email])
+  @@index([listId, status])
+}
+
+/// Where a user wants events sent (email sent / failed / bounced, campaign paused, …). The URL is untrusted input:
+/// it is checked when saved and again at the moment of connecting, and payloads are signed with `secretEnc`.
+model Webhook {
+  id              String            @id @default(cuid())
+  userId          String
+  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  url             String
+  /// HMAC key (AES-256-GCM at rest). The plaintext is shown once, when created or rotated.
+  secretEnc       String
+  events          String[]
+  /// Null = every campaign.
+  campaignId      String?
+  active          Boolean           @default(true)
+  failureCount    Int               @default(0)
+  lastDeliveryAt  DateTime?
+  lastStatus      String?
+  createdAt       DateTime          @default(now())
+  deliveries      WebhookDelivery[]
+
+  @@index([userId, active])
+}
+
+model WebhookDelivery {
+  id         String   @id @default(cuid())
+  webhookId  String
+  webhook    Webhook  @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+  event      String
+  ok         Boolean
+  httpStatus Int?
+  error      String?
+  attempt    Int      @default(1)
+  createdAt  DateTime @default(now())
+
+  @@index([webhookId, createdAt])
+}
+
+model Campaign {
+  id              String         @id @default(cuid())
+  userId          String
+  user            User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject         String
+  body            String
+  /// TEXT (plain, the original) or HTML (rich text, sanitised on the server).
+  bodyFormat      String         @default("TEXT")
+  startAt         DateTime
+  delayBetweenMs  Int
+  hourlyLimit     Int
+  senderStrategy  SenderStrategy @default(ROUND_ROBIN)
+  status          CampaignStatus @default(ACTIVE)
+  totalRecipients Int
+  /// Business-hours window ({startHour,endHour,timezone,weekdaysOnly}) or null = send any time.
+  sendWindow      Json?
+  /// "Skip people emailed in the last N days" that applied when this campaign was created (0 = off).
+  skipRecentDays  Int            @default(0)
+  /// Gaps between this campaign's emails vary by up to ±N% (0 = exact spacing).
+  jitterPercent   Int            @default(0)
+  /// Bounce protection: pause the campaign when hard bounces exceed this % of attempts (0 = off)…
+  bounceThresholdPercent Int     @default(10)
+  /// …but only once at least this many emails have been attempted, so one early bounce can't trip it.
+  bounceMinSends  Int            @default(20)
+  /// Why the campaign is paused when it wasn't a person: BOUNCE_PROTECTION. Null = paused by hand (or not paused).
+  pauseReason     String?
+  createdAt       DateTime       @default(now())
+  emails          Email[]
+  attachments     Attachment[]
+
+  @@index([userId, createdAt])
+}
+
+/// A file sent with every email of a campaign. Uploaded first (campaignId null = staged), then linked when the
+/// campaign is scheduled. Staged files nobody scheduled are swept on the owner's next upload (no timer).
+model Attachment {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  campaignId  String?
+  campaign    Campaign? @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  fileName    String
+  contentType String
+  size        Int
+  data        Bytes
+  createdAt   DateTime  @default(now())
+
+  @@index([userId, campaignId])
+  @@index([campaignId])
+}
+
+model Email {
+  id               String       @id @default(cuid()) /// == BullMQ jobId
+  campaignId       String
+  campaign         Campaign     @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  userId           String
+  senderId         String
+  sender           Sender       @relation(fields: [senderId], references: [id])
+  toEmail          String
+  toName           String?
+  vars             Json?
+  subject          String
+  body             String
+  /// True when `body` is sanitised HTML; the plain-text alternative is derived when sending.
+  bodyIsHtml       Boolean      @default(false)
+  sequence         Int
+  scheduledAt      DateTime
+  nextAttemptAt    DateTime
+  status           EmailStatus  @default(SCHEDULED)
+  attempts         Int          @default(0)
+  rateLimitedCount Int          @default(0)
+  messageId        String?      @unique
+  previewUrl       String?
+  sentAt           DateTime?
+  failedAt         DateTime?
+  /// First ~140 characters of the body, whitespace collapsed: the grey snippet in list rows.
+  preview          String       @default("")
+  /// The owner flagged this email (star in the list and on the detail page).
+  starred          Boolean      @default(false)
+  /// Tucked away from the lists (finished emails only). Kept, and reachable via the Archived filter.
+  archived         Boolean      @default(false)
+  /// Set when the recipient's server permanently rejected the address (hard bounce).
+  bouncedAt        DateTime?
+  lastError        String?
+  lockedAt         DateTime?
+  /// When the worker handed this email to SMTP (throttle spacing is measured here, not at sentAt).
+  dispatchedAt     DateTime?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+  events           EmailEvent[]
+
+  @@unique([campaignId, toEmail])
+  @@index([userId, status, nextAttemptAt])
+  @@index([userId, status, updatedAt])
+  @@index([status, lockedAt])
+}
+
+/// Status history of an email (detail timeline + analytics). Append-only.
+model EmailEvent {
+  id      String         @id @default(cuid())
+  emailId String
+  email   Email          @relation(fields: [emailId], references: [id], onDelete: Cascade)
+  userId  String
+  type    EmailEventType
+  at      DateTime       @default(now())
+  meta    Json?
+
+  @@index([emailId, at])
+  @@index([userId, type, at])
+}
+
+/// Audit trail of rate-limit hits; also dedupes Slack notifications per window.
+model RateLimitEvent {
+  id        String   @id @default(cuid())
+  senderId  String
+  userId    String
+  scope     String
+  windowKey String
+  hitAt     DateTime @default(now())
+  notified  Boolean  @default(false)
+
+  @@unique([senderId, userId, scope, windowKey])
+}
+
+enum EmailStatus {
+  SCHEDULED
+  RATE_LIMITED
+  SENDING
+  SENT
+  FAILED
+  CANCELLED
+}
+
+enum EmailEventType {
+  SCHEDULED
+  RATE_LIMITED
+  SEND_ERROR
+  SENT
+  FAILED
+  RETRIED
+  CANCELLED
+  PAUSED
+  RESUMED
+}
+
+enum CampaignStatus {
+  ACTIVE
+  PAUSED
+  CANCELLED
+  COMPLETED
+}
+
+enum SenderStrategy {
+  ROUND_ROBIN
+  FIXED
+}

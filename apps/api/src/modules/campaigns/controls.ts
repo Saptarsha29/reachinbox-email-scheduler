@@ -1,0 +1,201 @@
+import type { EmailEventType, PrismaClient } from '@prisma/client';
+import type { Redis } from 'ioredis';
+import { bounceVerdict, type CampaignStatus, type CampaignSummary } from '@ri/shared';
+import { AppError } from '../../lib/errors.js';
+import { publishLive } from '../../lib/live.js';
+import { enqueueEmails, enqueueIndex, type QueueSet } from '../../queues/queues.js';
+
+export type ControlDeps = { prisma: PrismaClient; queues: QueueSet; redis: Redis };
+
+const PENDING = ['SCHEDULED', 'RATE_LIMITED'] as const;
+
+/** Removes jobs by id; a job that is mid-send (locked) can't be removed, and the processor's
+ *  campaign-status check covers it. */
+async function removeJobs(queues: QueueSet, ids: string[]) {
+  for (let i = 0; i < ids.length; i += 200) {
+    await Promise.all(ids.slice(i, i + 200).map((id) => queues.email.remove(id).catch(() => 0)));
+  }
+}
+
+async function recordAndNotify(
+  deps: ControlDeps,
+  userId: string,
+  ids: string[],
+  type: EmailEventType,
+  reindex: boolean,
+) {
+  if (ids.length === 0) return;
+  for (let i = 0; i < ids.length; i += 1000) {
+    await deps.prisma.emailEvent.createMany({
+      data: ids.slice(i, i + 1000).map((emailId) => ({ emailId, userId, type })),
+    });
+  }
+  if (reindex) await enqueueIndex(deps.queues.index, ids);
+}
+
+async function ownCampaign(prisma: PrismaClient, userId: string, id: string) {
+  const c = await prisma.campaign.findFirst({ where: { id, userId } });
+  if (!c) throw AppError.notFound('Campaign not found');
+  return c;
+}
+
+const conflict = (msg: string) => new AppError(409, 'CONFLICT', msg);
+
+export async function pauseCampaign(userId: string, id: string, deps: ControlDeps) {
+  const c = await ownCampaign(deps.prisma, userId, id);
+  if (c.status !== 'ACTIVE') throw conflict(`Campaign is ${c.status.toLowerCase()}`);
+  await deps.prisma.campaign.update({ where: { id }, data: { status: 'PAUSED', pauseReason: null } });
+  const rows = await deps.prisma.email.findMany({ where: { campaignId: id, status: { in: [...PENDING] } }, select: { id: true } });
+  const ids = rows.map((r) => r.id);
+  await removeJobs(deps.queues, ids);
+  await recordAndNotify(deps, userId, ids, 'PAUSED', false);
+  await publishLive(deps.redis, userId, { type: 'campaign.updated', campaignId: id, status: 'PAUSED' });
+}
+
+/** Re-enqueues every pending email with its original jobId, in sequence order. Anything whose
+ *  time passed during the pause runs immediately — still through the rate limiter. */
+export async function resumeCampaign(userId: string, id: string, deps: ControlDeps) {
+  const c = await ownCampaign(deps.prisma, userId, id);
+  if (c.status !== 'PAUSED') throw conflict(`Campaign is ${c.status.toLowerCase()}, not paused`);
+  await deps.prisma.campaign.update({ where: { id }, data: { status: 'ACTIVE', pauseReason: null } });
+  const rows = await deps.prisma.email.findMany({
+    where: { campaignId: id, status: { in: [...PENDING] } },
+    select: { id: true, nextAttemptAt: true },
+    orderBy: { sequence: 'asc' },
+  });
+  const ids = rows.map((r) => r.id);
+  await removeJobs(deps.queues, ids); // clear any job that completed as "paused" so the id can be reused
+  await enqueueEmails(deps.queues.email, rows);
+  await recordAndNotify(deps, userId, ids, 'RESUMED', false);
+  await publishLive(deps.redis, userId, { type: 'campaign.updated', campaignId: id, status: 'ACTIVE' });
+}
+
+export async function cancelCampaign(userId: string, id: string, deps: ControlDeps) {
+  const c = await ownCampaign(deps.prisma, userId, id);
+  if (c.status === 'CANCELLED') throw conflict('Campaign is already cancelled');
+  await deps.prisma.campaign.update({ where: { id }, data: { status: 'CANCELLED' } });
+  const rows = await deps.prisma.email.findMany({ where: { campaignId: id, status: { in: [...PENDING] } }, select: { id: true } });
+  const ids = rows.map((r) => r.id);
+  await deps.prisma.email.updateMany({ where: { id: { in: ids }, status: { in: [...PENDING] } }, data: { status: 'CANCELLED' } });
+  await removeJobs(deps.queues, ids);
+  await recordAndNotify(deps, userId, ids, 'CANCELLED', true);
+  await publishLive(deps.redis, userId, { type: 'campaign.updated', campaignId: id, status: 'CANCELLED' });
+}
+
+/** FAILED → SCHEDULED, sent as soon as the limiter allows. The old failed job is replaced
+ *  (same jobId), so there is still exactly one job per email. */
+export async function retryEmail(userId: string, emailId: string, deps: ControlDeps) {
+  const e = await deps.prisma.email.findFirst({ where: { id: emailId, userId }, include: { campaign: true } });
+  if (!e) throw AppError.notFound('Email not found');
+  if (e.status !== 'FAILED') throw conflict('Only failed emails can be retried');
+  if (e.campaign.status === 'CANCELLED') throw conflict('Its campaign was cancelled');
+  const now = new Date();
+  const updated = await deps.prisma.email.updateMany({
+    where: { id: emailId, status: 'FAILED' },
+    data: { status: 'SCHEDULED', nextAttemptAt: now, failedAt: null, lastError: null, lockedAt: null },
+  });
+  if (updated.count === 0) throw conflict('Email changed, refresh and try again');
+  await deps.queues.email.remove(emailId).catch(() => 0);
+  if (e.campaign.status === 'ACTIVE') await enqueueEmails(deps.queues.email, [{ id: emailId, nextAttemptAt: now }]);
+  await recordAndNotify(deps, userId, [emailId], 'RETRIED', true);
+  await publishLive(deps.redis, userId, { type: 'email.updated', emailId, campaignId: e.campaignId, status: 'SCHEDULED' });
+}
+
+/** Bulk "Retry failed": every FAILED email of a campaign goes back to SCHEDULED and is sent as soon
+ *  as the limiter (and any business-hours window) allows — same effect as retrying each one. */
+export async function retryFailed(userId: string, campaignId: string, deps: ControlDeps): Promise<number> {
+  const c = await ownCampaign(deps.prisma, userId, campaignId);
+  if (c.status === 'CANCELLED') throw conflict('Campaign was cancelled');
+  const rows = await deps.prisma.email.findMany({ where: { campaignId, status: 'FAILED' }, select: { id: true }, orderBy: { sequence: 'asc' } });
+  if (rows.length === 0) return 0;
+  const ids = rows.map((r) => r.id);
+  const now = new Date();
+  const updated = await deps.prisma.email.updateMany({
+    where: { id: { in: ids }, status: 'FAILED' },
+    data: { status: 'SCHEDULED', nextAttemptAt: now, failedAt: null, lastError: null, lockedAt: null },
+  });
+  await removeJobs(deps.queues, ids); // drop the old failed jobs so the same ids can be queued again
+  // A paused campaign keeps them SCHEDULED; Resume enqueues every pending email.
+  if (c.status === 'ACTIVE') await enqueueEmails(deps.queues.email, ids.map((id) => ({ id, nextAttemptAt: now })));
+  await recordAndNotify(deps, userId, ids, 'RETRIED', true);
+  await publishLive(deps.redis, userId, { type: 'campaign.updated', campaignId, status: c.status });
+  return updated.count;
+}
+
+export async function cancelEmail(userId: string, emailId: string, deps: ControlDeps) {
+  const e = await deps.prisma.email.findFirst({ where: { id: emailId, userId } });
+  if (!e) throw AppError.notFound('Email not found');
+  const updated = await deps.prisma.email.updateMany({
+    where: { id: emailId, status: { in: [...PENDING] } },
+    data: { status: 'CANCELLED' },
+  });
+  if (updated.count === 0) throw conflict('Only scheduled emails can be cancelled');
+  await deps.queues.email.remove(emailId).catch(() => 0);
+  await recordAndNotify(deps, userId, [emailId], 'CANCELLED', true);
+  await publishLive(deps.redis, userId, { type: 'email.updated', emailId, campaignId: e.campaignId, status: 'CANCELLED' });
+}
+
+/** Campaign cards: per-status counts in one grouped query; "completed" is derived, not stored. */
+export async function listCampaigns(userId: string, prisma: PrismaClient): Promise<CampaignSummary[]> {
+  const campaigns = await prisma.campaign.findMany({ where: { userId }, orderBy: { createdAt: 'desc' }, take: 50 });
+  if (campaigns.length === 0) return [];
+  const ids = campaigns.map((c) => c.id);
+  const [grouped, pendingMax, bounces, pendingSenders] = await Promise.all([
+    prisma.email.groupBy({ by: ['campaignId', 'status'], where: { campaignId: { in: ids } }, _count: { _all: true } }),
+    prisma.email.groupBy({
+      by: ['campaignId'],
+      where: { campaignId: { in: ids }, status: { in: [...PENDING] } },
+      _max: { nextAttemptAt: true },
+    }),
+    prisma.email.groupBy({ by: ['campaignId'], where: { campaignId: { in: ids }, bouncedAt: { not: null } }, _count: { _all: true } }),
+    prisma.email.groupBy({ by: ['campaignId', 'senderId'], where: { campaignId: { in: ids }, status: { in: [...PENDING] } } }),
+  ]);
+  const senderIds = [...new Set(pendingSenders.map((p) => p.senderId))];
+  const senderRows = senderIds.length ? await prisma.sender.findMany({ where: { id: { in: senderIds } }, select: { id: true, isActive: true, pausedUntil: true } }) : [];
+  const senderById = new Map(senderRows.map((s) => [s.id, s]));
+  const nowMs = Date.now();
+  const count = (id: string, status: string) =>
+    grouped.find((g) => g.campaignId === id && g.status === status)?._count._all ?? 0;
+
+  return campaigns.map((c) => {
+    const counts = {
+      scheduled: count(c.id, 'SCHEDULED'),
+      rateLimited: count(c.id, 'RATE_LIMITED'),
+      sending: count(c.id, 'SENDING'),
+      sent: count(c.id, 'SENT'),
+      failed: count(c.id, 'FAILED'),
+      cancelled: count(c.id, 'CANCELLED'),
+    };
+    const pending = counts.scheduled + counts.rateLimited + counts.sending;
+    const status: CampaignStatus = c.status === 'ACTIVE' && pending === 0 ? 'COMPLETED' : c.status;
+    const bounced = bounces.find((b) => b.campaignId === c.id)?._count._all ?? 0;
+    const verdict = bounceVerdict({ sent: counts.sent, bounced }, { thresholdPercent: c.bounceThresholdPercent, minSends: c.bounceMinSends });
+    // Nothing will go out if every sender with waiting emails is removed or cooling down.
+    const waiting = pendingSenders.filter((p) => p.campaignId === c.id).map((p) => senderById.get(p.senderId));
+    const senderBlocked: CampaignSummary['senderBlocked'] =
+      c.status !== 'ACTIVE' || waiting.length === 0
+        ? null
+        : waiting.every((s) => !s || !s.isActive)
+          ? 'INACTIVE'
+          : waiting.every((s) => !s || !s.isActive || (s.pausedUntil?.getTime() ?? 0) > nowMs)
+            ? 'PAUSED'
+            : null;
+    return {
+      id: c.id,
+      subject: c.subject,
+      status,
+      createdAt: c.createdAt.toISOString(),
+      startAt: c.startAt.toISOString(),
+      delayBetweenMs: c.delayBetweenMs,
+      hourlyLimit: c.hourlyLimit,
+      total: c.totalRecipients,
+      counts,
+      lastPendingAt: pendingMax.find((p) => p.campaignId === c.id)?._max.nextAttemptAt?.toISOString() ?? null,
+      bounced,
+      bounceRate: verdict.ratePercent === null ? null : Math.round(verdict.ratePercent * 10) / 10,
+      bounceProtection: { thresholdPercent: c.bounceThresholdPercent, minSends: c.bounceMinSends },
+      pauseReason: c.pauseReason === 'BOUNCE_PROTECTION' ? 'BOUNCE_PROTECTION' : null,
+      senderBlocked,
+    };
+  });
+}
