@@ -7,11 +7,7 @@ losing or duplicating a single email, and watch it all happen live.
 Built with **TypeScript · Express · BullMQ + Redis · PostgreSQL (Prisma) · Elasticsearch · React + Tailwind**.
 No cron anywhere — every send time is a BullMQ delayed job.
 
-> 📋 **Verification & drills:** [`docs/VERIFICATION.md`](docs/VERIFICATION.md) · 🎬 **Demo script:** [`docs/DEMO_SCRIPT.md`](docs/DEMO_SCRIPT.md) · 📦 **Repo:** https://github.com/Saptarsha29/reachinbox-email-scheduler
 
-![Scheduled emails, rate-limited rows resuming in order](docs/screenshots/scheduled.png)
-
----
 
 ## Contents
 
