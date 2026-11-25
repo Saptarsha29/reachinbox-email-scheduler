@@ -7,7 +7,7 @@ losing or duplicating a single email, and watch it all happen live.
 Built with **TypeScript · Express · BullMQ + Redis · PostgreSQL (Prisma) · Elasticsearch · React + Tailwind**.
 No cron anywhere — every send time is a BullMQ delayed job.
 
-> ▶ **Demo video:** https://drive.google.com/file/d/1HoR1W8dbNRUeALc_BVn08EHqL2wGDkqZ/view?usp=drive_link · 📋 **Evidence for every claim below:** [`docs/VERIFICATION.md`](docs/VERIFICATION.md)
+> 📋 **Verification & drills:** [`docs/VERIFICATION.md`](docs/VERIFICATION.md) · 🎬 **Demo script:** [`docs/DEMO_SCRIPT.md`](docs/DEMO_SCRIPT.md) · 📦 **Repo:** https://github.com/Saptarsha29/reachinbox-email-scheduler
 
 ![Scheduled emails, rate-limited rows resuming in order](docs/screenshots/scheduled.png)
 
@@ -432,7 +432,6 @@ Postgres/Redis/Elasticsearch services, the build, and `npm audit`.
 - **Connecting an account logs in to the SMTP server first**, and refuses hosts on private networks so the form can't be used to probe the internal network.
 - **Email + password exists next to Google** because the Figma login shows it. The brief requires real Google OAuth, which is unchanged. There is no password reset or email verification yet.
 - **Onboarding never redirects.** The brief says login lands on the dashboard, so the wizard, checklist and tour are opt-in from the sidebar.
-- **The compose body is plain text** (merge tags and spintax, no bold/lists/attachments): rich text would need HTML email and sanitising.
 - **Ask Inbox is rule-based ("offline mode"), on purpose.** It understands a defined set of English phrasings
   (≈ 90 tested), not free-form language, but it needs no API key, is deterministic, and can never invent a
   number: every answer is computed from your own data. Every change is _proposed_, and only carried out
@@ -473,3 +472,9 @@ apps/web      React + Vite + Tailwind dashboard
 packages/shared  zod schemas + types shared by both (API contract enforced at runtime)
 scripts       setup, no-cron guard          docs  verification log, demo script, screenshots
 ```
+
+---
+
+### Maintainer
+
+**Saptarsha Saha** (`saptarshasaha6@gmail.com`) · https://github.com/Saptarsha29/reachinbox-email-scheduler

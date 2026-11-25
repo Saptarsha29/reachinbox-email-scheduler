@@ -5,6 +5,7 @@
 > If a decision here conflicts with your instinct, this file wins. If this file is wrong, fix it here first.
 
 - **Assignment:** ReachInbox (Outbox Labs), Software Development Intern, "Full-stack Email Job Scheduler"
+- **Owner & Repository:** **Saptarsha Saha** (`saptarshasaha6@gmail.com`) · `https://github.com/Saptarsha29/reachinbox-email-scheduler`
 - **Nature:** an elimination round. **Every stated requirement must be met *exactly* and be demonstrable.** Extras come only after the core is fully working.
 - **Inspiration:** https://reachinbox.ai: "Smart Time Gaps", Onebox, live analytics, sender Health Score, Slack alerts
 - **Figma:** https://www.figma.com/design/kOTwGlESjijCYnMgtHfvfU/Outbox-Labs-Assignment?node-id=59-4050 (see §9.0; access is currently blocked)
